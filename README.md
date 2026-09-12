@@ -88,6 +88,8 @@ podman build --platform linux/arm64 --manifest nva2dlna:latest .
 
 每个压缩包都包含原生可执行文件、`web/dist`、README 和许可证。请完整解压并从包的根目录启动程序；Linux 压缩包保留可执行权限。原生发布包不捆绑 FFmpeg，运行前仍需将对应平台的 `ffmpeg` 放入 PATH，或通过 `NVA2DLNA_FFMPEG` 指定路径。容器镜像则已经包含 FFmpeg。
 
+只有推送 Git tag 时才会自动创建同名 GitHub Release：三个平台全部构建成功后，工作流会生成发行说明并上传上述三个压缩包。普通分支 push、pull request 和手动运行只生成 Actions artifact，不会发布 Release；同一 tag 的工作流重试会更新已有 Release 的附件。
+
 ## 配置
 
 所有命令行参数都有对应环境变量：

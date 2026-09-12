@@ -1,0 +1,26 @@
+services:
+  nva2dlna:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: localhost/nva2dlna:latest
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      NVA2DLNA_CONFIG: /app/data/config.json
+      NVA2DLNA_WEB_DIR: /app/web/dist
+      RUST_LOG: nva2dlna=info
+    volumes:
+      - nva2dlna-data:/app/data
+    security_opt:
+      - no-new-privileges
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    pids_limit: 256
+    mem_limit: 512m
+
+volumes:
+  nva2dlna-data:

@@ -1,0 +1,88 @@
+name: Build release bundles
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.artifact }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact: nva2dlna-windows-amd64
+            runner: windows-2022
+            archive: zip
+          - artifact: nva2dlna-linux-amd64
+            runner: ubuntu-22.04
+            archive: tar.gz
+          - artifact: nva2dlna-linux-arm64
+            runner: ubuntu-22.04-arm
+            archive: tar.gz
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web dashboard
+        working-directory: web
+        shell: bash
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install Rust 1.88
+        shell: bash
+        run: rustup toolchain install 1.88.0 --profile minimal --no-self-update
+
+      - name: Build native release binary
+        shell: bash
+        run: cargo +1.88.0 build --locked --release
+
+      - name: Package Windows release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bundle = "dist/${{ matrix.artifact }}"
+          New-Item -ItemType Directory -Force "$bundle/web" | Out-Null
+          Copy-Item -LiteralPath "target/release/nva2dlna.exe" -Destination "$bundle/nva2dlna.exe"
+          Copy-Item -LiteralPath "web/dist" -Destination "$bundle/web/dist" -Recurse
+          Copy-Item -LiteralPath "README.md", "LICENSE" -Destination $bundle
+          Compress-Archive -LiteralPath $bundle -DestinationPath "dist/${{ matrix.artifact }}.zip"
+
+      - name: Package Linux release
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="dist/${{ matrix.artifact }}"
+          mkdir -p "$bundle/web"
+          install -m 0755 target/release/nva2dlna "$bundle/nva2dlna"
+          cp -R web/dist "$bundle/web/dist"
+          cp README.md LICENSE "$bundle/"
+          tar -C dist -czf "dist/${{ matrix.artifact }}.tar.gz" "${{ matrix.artifact }}"
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.${{ matrix.archive }}
+          if-no-files-found: error
+          compression-level: 0

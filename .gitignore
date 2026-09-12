@@ -1,0 +1,9 @@
+/target
+/target-*
+/web/dist
+/web/node_modules
+/data
+/dist
+*.tsbuildinfo
+*.log
+/docs

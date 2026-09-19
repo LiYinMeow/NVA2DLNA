@@ -11,23 +11,30 @@ pub const CONNECTION_MANAGER: &str = "urn:schemas-upnp-org:service:ConnectionMan
 pub const NIRVANA_SERVICE: &str = "urn:app-bilibili-com:service:NirvanaControl:3";
 pub const NIRVANA_DISCOVERY: &str = "urn:schemas-upnp-org:service:NirvanaControl:3";
 
+/// Combined danmaku + 4K compatibility value used by the current UDashboard
+/// receiver. Keep this independent from the strict `friendlyName` fingerprint.
+pub const NVA_CAPABILITY: &str = "255";
+/// The Yunshiting receiver build the device description reports alongside
+/// [`NVA_CAPABILITY`]; recent Android clients read both before offering danmaku.
+pub const NVA_OTT_VERSION: &str = "106400";
+
 pub fn description_xml(state: &AppState, nva_port: u16) -> String {
-    let base = format!("http://{}:{nva_port}", state.advertise_ip());
-    let id = nva_tv_id(state.device_uuid());
+    let base = format!("http://{}:{nva_port}/", state.advertise_ip());
+    let id = nva_tv_id(state.nva_device_uuid());
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
 <root xmlns=\"urn:schemas-upnp-org:device-1-0\" xmlns:dlna=\"urn:schemas-dlna-org:device-1-0\">\
 <specVersion><major>1</major><minor>0</minor></specVersion><URLBase>{base}</URLBase><device>\
-<deviceType>{MEDIA_RENDERER}</deviceType><friendlyName>{name}</friendlyName>\
+<deviceType>{MEDIA_RENDERER}</deviceType><friendlyName>我的小电视</friendlyName>\
 <manufacturer>Bilibili Inc.</manufacturer><manufacturerURL>https://bilibili.com/</manufacturerURL>\
 <modelDescription>云视听小电视</modelDescription><modelName>16s</modelName>\
 <modelNumber>1024</modelNumber><modelURL>https://app.bilibili.com/</modelURL>\
 <serialNumber>1024</serialNumber><UDN>uuid:{id}</UDN>\
-<X_brandName>nva2dlna</X_brandName><hostVersion>25</hostVersion><ottVersion>106400</ottVersion>\
-<channelName>master</channelName><capability>254</capability>\
+<X_brandName>{brand}</X_brandName><hostVersion>25</hostVersion><ottVersion>{NVA_OTT_VERSION}</ottVersion>\
+<channelName>master</channelName><capability>{NVA_CAPABILITY}</capability>\
 <dlna:X_DLNADOC>DMR-1.50</dlna:X_DLNADOC><dlna:X_DLNACAP>playcontainer-1-0</dlna:X_DLNACAP>\
 <serviceList>{services}</serviceList></device></root>",
-        name = xml_escape(state.friendly_name()),
+        brand = xml_escape(state.nva_name()),
         services = service_list(),
     )
 }
@@ -172,7 +179,7 @@ pub fn xml_escape(value: &str) -> String {
     output
 }
 
-pub fn didl(title: &str, media_url: &str, mime: &str) -> String {
+pub fn didl(title: &str, media_url: &str, mime: &str, duration_ms: Option<u64>) -> String {
     let class = if mime.starts_with("audio/") {
         "object.item.audioItem.musicTrack"
     } else if mime.starts_with("image/") {
@@ -180,13 +187,17 @@ pub fn didl(title: &str, media_url: &str, mime: &str) -> String {
     } else {
         "object.item.videoItem"
     };
+    let duration = duration_ms
+        .filter(|duration| *duration > 0)
+        .map(|duration| format!(" duration=\"{}\"", didl_duration(duration)))
+        .unwrap_or_default();
     let mut xml = String::new();
     write!(
         xml,
         "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" \
 xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">\
 <item id=\"0\" parentID=\"0\" restricted=\"1\"><dc:title>{}</dc:title>\
-<upnp:class>{class}</upnp:class><res protocolInfo=\"http-get:*:{mime}:*\">{}</res></item></DIDL-Lite>",
+<upnp:class>{class}</upnp:class><res protocolInfo=\"http-get:*:{mime}:*\"{duration}>{}</res></item></DIDL-Lite>",
         xml_escape(title),
         xml_escape(media_url)
     )
@@ -194,11 +205,25 @@ xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:upnp=\"urn:schemas-upnp-org:
     xml
 }
 
+fn didl_duration(duration_ms: u64) -> String {
+    let total_seconds = duration_ms / 1_000;
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        total_seconds / 3_600,
+        total_seconds / 60 % 60,
+        total_seconds % 60,
+        duration_ms % 1_000
+    )
+}
+
+static NIRVANA_SCPD: OnceLock<String> = OnceLock::new();
+
+// The NVA origin does not expose a standards-only DMR input. Advertising full
+// standard action tables here makes control points probe SOAP endpoints that are
+// intentionally absent and can downgrade the same origin to generic DLNA.
 const EMPTY_SCPD: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
 <scpd xmlns=\"urn:schemas-upnp-org:service-1-0\"><specVersion><major>1</major><minor>0</minor>\
 </specVersion><actionList></actionList><serviceStateTable></serviceStateTable></scpd>";
-
-static NIRVANA_SCPD: OnceLock<String> = OnceLock::new();
 
 fn build_nirvana_scpd() -> String {
     let mut xml = String::with_capacity(4_096);
@@ -352,11 +377,24 @@ mod tests {
 
     #[test]
     fn escapes_nested_didl_for_soap_in_two_distinct_steps() {
-        let didl = didl("A & B", "http://10.0.0.2/a?x=1&y=2", "video/mp2t");
+        let didl = didl("A & B", "http://10.0.0.2/a?x=1&y=2", "video/mp2t", None);
         assert!(didl.contains("A &amp; B"));
         assert!(didl.contains("x=1&amp;y=2"));
+        assert!(!didl.contains(" duration="));
         let soap_value = xml_escape(&didl);
         assert!(soap_value.contains("&lt;DIDL-Lite"));
+    }
+
+    #[test]
+    fn didl_exposes_a_known_media_duration() {
+        let didl = didl(
+            "Timed",
+            "http://10.0.0.2/video.mp4",
+            "video/mp4",
+            Some(296_789),
+        );
+        assert!(didl.contains(" duration=\"00:04:56.789\""), "{didl}");
+        assert_eq!(didl_duration(3_600_000), "01:00:00.000");
     }
 
     #[test]
@@ -387,19 +425,43 @@ mod tests {
         let config = crate::config::RuntimeConfig {
             web_listen: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8080),
             nva_listen: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 9959),
+            lelink_listen: SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 52288),
             advertise_ip: Ipv4Addr::new(192, 0, 2, 10),
             config_path: PathBuf::from("unused-config.json"),
             web_dir: PathBuf::from("web/dist"),
             ffmpeg: PathBuf::from("ffmpeg"),
-            friendly_name: "我的小电视".into(),
+            nva_name: "UniNVA".into(),
+            dlna_name: "UniDLNA".into(),
+            lelink_name: "UniLE".into(),
             device_uuid: Uuid::nil(),
+            nva_device_uuid: Uuid::nil(),
+            retired_nva_device_uuid: None,
             selected_udn: None,
+            scan_interface_ids: Vec::new(),
         };
         let state = AppState::new(&config).expect("test state");
         let description = description_xml(&state, 9959);
         assert!(description.contains("<modelURL>https://app.bilibili.com/</modelURL>"));
-        assert!(description.contains("<X_brandName>nva2dlna</X_brandName>"));
+        assert!(description.contains("<URLBase>http://192.0.2.10:9959/</URLBase>"));
+        assert!(description.contains("<friendlyName>我的小电视</friendlyName>"));
+        assert!(!description.contains("<friendlyName>UniNVA</friendlyName>"));
+        assert!(description.contains("<X_brandName>UniNVA</X_brandName>"));
         assert!(!description.contains("Meizu"));
+        assert!(description.contains("<capability>255</capability>"));
+        assert!(description.contains("<ottVersion>106400</ottVersion>"));
+    }
+
+    #[test]
+    fn nva_origin_does_not_claim_unimplemented_standard_soap_actions() {
+        for path in [
+            "/dlna/AVTransport.xml",
+            "/dlna/RenderingControl.xml",
+            "/dlna/ConnectionManager.xml",
+        ] {
+            let scpd = service_document(path).expect("compatibility SCPD");
+            assert!(scpd.contains("<actionList></actionList>"));
+            assert!(!scpd.contains("<name>Play</name>"));
+        }
     }
 
     #[test]

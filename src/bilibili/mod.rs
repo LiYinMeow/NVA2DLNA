@@ -19,6 +19,10 @@ const LIVE_PLAY_URL: &str = "https://api.live.bilibili.com/xlive/web-room/v2/ind
 const MAX_API_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_EMBEDDED_METADATA_BYTES: usize = 256 * 1024;
 const MAX_API_REDIRECTS: usize = 3;
+/// The best picture a sender can ask for. The TV playurl endpoint only lists it in
+/// `accept_quality` when the request itself is made at that ceiling, so a receiver that
+/// always asks for the sender's current 1080p choice never learns that 4K exists.
+const NVA_4K_QUALITY: u64 = 120;
 
 // Public application identities used by deployed TV/Nirvana receivers. They
 // identify the emulated application and are deliberately not user-configurable.
@@ -46,6 +50,7 @@ pub struct ResolvedMedia {
     pub title: String,
     pub quality: String,
     pub available_qualities: Vec<u64>,
+    pub duration_ms: Option<u64>,
     pub live: bool,
 }
 
@@ -55,9 +60,11 @@ pub struct PlayRequest {
     pub oid: String,
     pub cid: String,
     pub episode_id: String,
+    pub season_id: String,
     pub room_id: String,
     pub access_key: String,
     pub desired_quality: u64,
+    pub content_type: u64,
     pub seek_position_ms: u64,
     pub title: String,
 }
@@ -69,9 +76,11 @@ impl Default for PlayRequest {
             oid: String::new(),
             cid: String::new(),
             episode_id: String::new(),
+            season_id: String::new(),
             room_id: String::new(),
             access_key: String::new(),
             desired_quality: 80,
+            content_type: 1,
             seek_position_ms: 0,
             title: String::new(),
         }
@@ -86,9 +95,11 @@ impl std::fmt::Debug for PlayRequest {
             .field("oid", &self.oid)
             .field("cid", &self.cid)
             .field("episode_id", &self.episode_id)
+            .field("season_id", &self.season_id)
             .field("room_id", &self.room_id)
             .field("access_key", &"[redacted]")
             .field("desired_quality", &self.desired_quality)
+            .field("content_type", &self.content_type)
             .field("seek_position_ms", &self.seek_position_ms)
             .field("title", &self.title)
             .finish()
@@ -121,6 +132,7 @@ impl PlayRequest {
             oid,
             cid: value_string(object.get("cid")),
             episode_id,
+            season_id: value_string(object.get("seasonId").or_else(|| object.get("season_id"))),
             room_id: value_string(
                 object
                     .get("roomId")
@@ -138,6 +150,12 @@ impl PlayRequest {
                     .or_else(|| object.get("current_qn")),
             )
             .unwrap_or(80),
+            content_type: value_u64(
+                object
+                    .get("contentType")
+                    .or_else(|| object.get("content_type")),
+            )
+            .unwrap_or(1),
             seek_position_ms: seek_value
                 .map(|value| nva_seek_position_ms(Some(value)))
                 .transpose()?
@@ -169,6 +187,13 @@ enum TvProfile {
 }
 
 impl TvProfile {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AndroidDash => "android-tv-dash",
+            Self::Legacy => "legacy-nirvana",
+        }
+    }
+
     fn app_key(self) -> &'static str {
         match self {
             Self::AndroidDash => ANDROID_TV_APP_KEY,
@@ -255,6 +280,7 @@ impl BilibiliResolver {
                 &["oid", "object_id"],
                 &["cid"],
                 &["epId", "ep_id", "epid"],
+                &["seasonId", "season_id"],
                 &["roomId", "room_id", "roomid"],
                 &["accessKey", "access_key"],
                 &[
@@ -265,6 +291,7 @@ impl BilibiliResolver {
                     "currentQn",
                     "current_qn",
                 ],
+                &["contentType", "content_type"],
                 &["seekTs", "seek_ts"],
             ] {
                 if aliases.iter().any(|key| target.contains_key(*key)) {
@@ -309,6 +336,7 @@ impl BilibiliResolver {
                     title: request.title_or_default(),
                     quality: "source".into(),
                     available_qualities: Vec::new(),
+                    duration_ms: None,
                     live: is_real_id(&request.room_id),
                 },
             )),
@@ -340,8 +368,12 @@ impl BilibiliResolver {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        self.get_json_url(signed_tv_play_url(request, timestamp, profile))
-            .await
+        let api_requested_quality = tv_api_requested_quality(request.desired_quality, profile);
+        let value = self
+            .get_json_url(signed_tv_play_url(request, timestamp, profile))
+            .await?;
+        log_playurl_quality(profile, api_requested_quality, request, &value);
+        Ok(value)
     }
 
     async fn get_json_url(&self, mut url: Url) -> Result<Value> {
@@ -420,13 +452,129 @@ impl PlayRequest {
 
 fn resolved_media(request: &PlayRequest, value: &Value) -> Result<ResolvedMedia> {
     let quality = quality_label(value, request.desired_quality);
+    let live = is_real_id(&request.room_id);
     Ok(ResolvedMedia {
         source: extract_media_source(value, request.desired_quality)?,
         available_qualities: quality_options(value, quality.parse().unwrap_or(0)),
         title: request.title_or_default(),
         quality,
-        live: is_real_id(&request.room_id),
+        duration_ms: if live {
+            None
+        } else {
+            playurl_duration_ms(value)
+        },
+        live,
     })
+}
+
+/// Bilibili reports the authoritative VOD length in `timelength` milliseconds.
+/// Older/variant playurl payloads can omit it while retaining a DASH duration in
+/// seconds or per-segment `durl[].length` values in milliseconds.
+fn playurl_duration_ms(value: &Value) -> Option<u64> {
+    let root = value
+        .get("data")
+        .or_else(|| value.get("result"))
+        .unwrap_or(value);
+    value_u64(
+        root.get("timelength")
+            .or_else(|| root.get("time_length"))
+            .or_else(|| root.get("timeLength")),
+    )
+    .filter(|duration| *duration > 0)
+    .or_else(|| {
+        root.get("dash")
+            .and_then(|dash| value_seconds_ms(dash.get("duration")))
+            .filter(|duration| *duration > 0)
+    })
+    .or_else(|| {
+        root.get("durl")
+            .and_then(Value::as_array)
+            .filter(|segments| !segments.is_empty())
+            .and_then(|segments| {
+                segments.iter().try_fold(0_u64, |total, segment| {
+                    total.checked_add(value_u64(segment.get("length"))?)
+                })
+            })
+            .filter(|duration| *duration > 0)
+    })
+}
+
+fn value_seconds_ms(value: Option<&Value>) -> Option<u64> {
+    let seconds = value.and_then(|value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|value| value.trim().parse().ok()))
+    })?;
+    let milliseconds = seconds * 1_000.0;
+    (seconds.is_finite()
+        && seconds > 0.0
+        && milliseconds.is_finite()
+        && milliseconds <= u64::MAX as f64)
+        .then(|| milliseconds.round() as u64)
+}
+
+/// The `qn` a profile is asked for. Only the Android TV DASH profile probes at the 4K
+/// ceiling, because the legacy Nirvana profile answers with a `durl` menu sized to the
+/// requested value and would report a worse picture than the sender chose. Selection
+/// elsewhere still uses `desired_quality`, so this never upgrades the played stream.
+fn tv_api_requested_quality(desired_quality: u64, profile: TvProfile) -> u64 {
+    match profile {
+        TvProfile::AndroidDash => desired_quality.max(NVA_4K_QUALITY),
+        TvProfile::Legacy => desired_quality,
+    }
+}
+
+/// Which side dropped a quality. Without this a missing 4K entry cannot be told apart
+/// from an account that simply is not entitled to one.
+fn log_playurl_quality(
+    profile: TvProfile,
+    api_requested_quality: u64,
+    request: &PlayRequest,
+    response: &Value,
+) {
+    let root = response
+        .get("data")
+        .or_else(|| response.get("result"))
+        .unwrap_or(response);
+    let response_quality = value_u64(root.get("quality"));
+    let accept_quality = root
+        .get("accept_quality")
+        .or_else(|| root.get("acceptQuality"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value_u64(Some(value)))
+        .take(16)
+        .collect::<Vec<_>>();
+    info!(
+        stage = "playurl-quality",
+        profile = profile.label(),
+        controller_requested_quality = request.desired_quality,
+        api_requested_quality,
+        response_quality = response_quality.unwrap_or_default(),
+        response_quality_present = response_quality.is_some(),
+        accept_quality = %accept_quality
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        delivery = media_delivery(root),
+        "Bilibili answered a playurl quality request"
+    );
+}
+
+fn media_delivery(root: &Value) -> &'static str {
+    if root.get("dash").is_some_and(|dash| !dash.is_null()) {
+        "dash"
+    } else if root
+        .get("durl")
+        .and_then(Value::as_array)
+        .is_some_and(|segments| !segments.is_empty())
+    {
+        "durl"
+    } else {
+        "none"
+    }
 }
 
 fn signed_tv_play_url(request: &PlayRequest, timestamp: u64, profile: TvProfile) -> Url {
@@ -449,7 +597,10 @@ fn signed_tv_play_url(request: &PlayRequest, timestamp: u64, profile: TvProfile)
             }
             .into(),
         ),
-        ("qn", request.desired_quality.to_string()),
+        (
+            "qn",
+            tv_api_requested_quality(request.desired_quality, profile).to_string(),
+        ),
         ("ts", timestamp.to_string()),
     ]);
     match profile {
@@ -563,15 +714,80 @@ mod tests {
             "aid": 1,
             "cid": 2,
             "accessKey": "secret",
-            "userDesireQn": 116
+            "userDesireQn": 116,
+            "seasonId": "44",
+            "contentType": "2"
         }))
         .unwrap();
         assert_eq!(request.desired_quality, 116);
+        assert_eq!(request.season_id, "44");
+        assert_eq!(request.content_type, 2);
         assert!(!format!("{request:?}").contains("secret"));
     }
 
     #[test]
-    fn signed_android_request_asks_for_dash() {
+    fn resolves_the_exact_playurl_duration_in_milliseconds() {
+        let request = PlayRequest {
+            aid: "1".into(),
+            oid: "1".into(),
+            cid: "2".into(),
+            title: "Timed video".into(),
+            ..PlayRequest::default()
+        };
+        let media = resolved_media(
+            &request,
+            &json!({"data": {
+                "quality": 80,
+                "timelength": 296_789,
+                "dash": {"duration": 297},
+                "durl": [{
+                    "url": "https://cdn.bilivideo.com/video.mp4",
+                    "length": 296_000
+                }]
+            }}),
+        )
+        .unwrap();
+        assert_eq!(media.duration_ms, Some(296_789));
+    }
+
+    #[test]
+    fn playurl_duration_uses_documented_fallback_units() {
+        assert_eq!(
+            playurl_duration_ms(&json!({"data": {"dash": {"duration": "1.25"}}})),
+            Some(1_250)
+        );
+        assert_eq!(
+            playurl_duration_ms(&json!({"result": {"durl": [
+                {"length": "1200"},
+                {"length": 345}
+            ]}})),
+            Some(1_545)
+        );
+        assert_eq!(
+            playurl_duration_ms(&json!({"data": {"timelength": 0}})),
+            None
+        );
+    }
+
+    #[test]
+    fn live_media_never_claims_a_finite_playurl_duration() {
+        let request = PlayRequest {
+            room_id: "42".into(),
+            ..PlayRequest::default()
+        };
+        let media = resolved_media(
+            &request,
+            &json!({"data": {
+                "timelength": 296_789,
+                "durl": [{"url": "https://cdn.bilivideo.com/live.flv"}]
+            }}),
+        )
+        .unwrap();
+        assert_eq!(media.duration_ms, None);
+    }
+
+    #[test]
+    fn signed_android_request_asks_for_dash_at_the_4k_ceiling() {
         let request = PlayRequest {
             aid: "1".into(),
             oid: "1".into(),
@@ -582,6 +798,27 @@ mod tests {
         let url = signed_tv_play_url(&request, 123, TvProfile::AndroidDash);
         let query = url.query_pairs().collect::<BTreeMap<_, _>>();
         assert_eq!(query.get("fnval").map(|v| v.as_ref()), Some("976"));
-        assert_eq!(query.get("qn").map(|v| v.as_ref()), Some("116"));
+        // The menu is only as good as the ceiling it was probed at, so the request goes
+        // out at 120 while track selection still honours the sender's 116.
+        assert_eq!(query.get("qn").map(|v| v.as_ref()), Some("120"));
+        assert_eq!(
+            tv_api_requested_quality(request.desired_quality, TvProfile::Legacy),
+            116,
+            "the legacy profile must not be asked for better picture than chosen"
+        );
+        assert_eq!(
+            tv_api_requested_quality(NVA_4K_QUALITY + 1, TvProfile::AndroidDash),
+            121,
+            "a sender already above the ceiling is never lowered"
+        );
+        let selected = json!({"data": {"quality": 116, "dash": {"video": [
+            {"id": 116, "codecs": 12, "bandwidth": 100, "baseUrl": "https://cdn.bilivideo.cn/a.m4s"},
+            {"id": 120, "codecs": 12, "bandwidth": 400, "baseUrl": "https://cdn.bilivideo.cn/b.m4s"}
+        ], "audio": []}}});
+        assert_eq!(
+            quality_label(&selected, request.desired_quality),
+            "116",
+            "probing at 4K must not silently upgrade the played stream"
+        );
     }
 }

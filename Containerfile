@@ -25,6 +25,6 @@ WORKDIR /app
 COPY --from=rust-build /source/target/release/nva2dlna /usr/local/bin/nva2dlna
 COPY --from=web-build /source/web/dist /app/web/dist
 VOLUME ["/app/data"]
-EXPOSE 8080/tcp 9959/tcp 1900/udp
+EXPOSE 8080/tcp 9958/tcp 52288/tcp 1900/udp 25353/udp
 USER 10001:10001
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/nva2dlna"]

@@ -3,13 +3,18 @@ services:
     build:
       context: .
       dockerfile: Containerfile
-    image: localhost/nva2dlna:latest
+    image: ${NVA2DLNA_IMAGE:-ghcr.io/liyinmeow/nva2dlna:latest}
     network_mode: host
     restart: unless-stopped
     environment:
-      NVA2DLNA_CONFIG: /app/data/config.json
-      NVA2DLNA_WEB_DIR: /app/web/dist
-      RUST_LOG: nva2dlna=info
+      - NVA2DLNA_CONFIG=/app/data/config.json
+      - NVA2DLNA_WEB_DIR=/app/web/dist
+      # Pass these through only when explicitly set. Omitting them preserves
+      # both the application defaults and legacy NVA2DLNA_WEB_LISTEN overrides.
+      - NVA2DLNA_WEB_LISTEN
+      - NVA2DLNA_WEB_IP
+      - NVA2DLNA_WEB_PORT
+      - RUST_LOG=nva2dlna=info
     volumes:
       - nva2dlna-data:/app/data
     security_opt:

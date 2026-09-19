@@ -19,7 +19,11 @@ use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use reqwest::{Client, Url, redirect::Policy};
 use tokio::{
-    io::AsyncReadExt, net::lookup_host, process::Command, sync::OwnedSemaphorePermit, time,
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
+    net::lookup_host,
+    process::Command,
+    sync::OwnedSemaphorePermit,
+    time,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -39,6 +43,7 @@ const MAX_HLS_PLAYLIST_BYTES: usize = 4 * 1024 * 1024;
 const MAX_HLS_RESOURCES: usize = 4096;
 const HLS_SNIFF_BYTES: usize = 1024;
 const FFMPEG_CONSUMER_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const MAX_FFMPEG_DIAGNOSTICS_BYTES: usize = 64 * 1024;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -191,12 +196,12 @@ async fn upstream_response(
     headers: HeaderMap,
     head_only: bool,
 ) -> Response<Body> {
-    if !peer.ip().is_loopback() && peer.ip() != IpAddr::V4(state.advertise_ip()) {
-        return simple(StatusCode::FORBIDDEN, "upstream proxy is loopback-only");
-    }
     let Some(entry) = state.media(&token).await else {
         return simple(StatusCode::NOT_FOUND, "media token is no longer active");
     };
+    if !internal_or_cast_peer(&state, &entry, peer.ip()) {
+        return simple(StatusCode::FORBIDDEN, "upstream proxy is cast-session-only");
+    }
     if let (MediaInput::Remux { url, format }, "source") = (&entry.input, track.as_str()) {
         return match hls_or_media_response(
             &state,
@@ -274,12 +279,12 @@ async fn hls_resource_response(
     headers: HeaderMap,
     head_only: bool,
 ) -> Response<Body> {
-    if !peer.ip().is_loopback() && peer.ip() != IpAddr::V4(state.advertise_ip()) {
-        return simple(StatusCode::FORBIDDEN, "HLS proxy is loopback-only");
-    }
     let Some(entry) = state.media(&token).await else {
         return simple(StatusCode::NOT_FOUND, "media token is no longer active");
     };
+    if !internal_or_cast_peer(&state, &entry, peer.ip()) {
+        return simple(StatusCode::FORBIDDEN, "HLS proxy is cast-session-only");
+    }
     let url = {
         let mut resources = entry.hls_resources.write().await;
         touch_hls_resource(&mut resources, &resource)
@@ -655,10 +660,23 @@ fn local_hls_resource_url(
     }
     Ok(format!(
         "http://{}:{}/upstream/{}/hls/{resource}",
-        state.advertise_ip(),
+        entry.gateway_address,
         state.web_port(),
         entry.token
     ))
+}
+
+fn internal_or_cast_peer(state: &AppState, entry: &MediaEntry, peer: IpAddr) -> bool {
+    peer.is_loopback()
+        || peer == IpAddr::V4(state.internal_http_ip())
+        || entry
+            .gateway_address
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address == peer)
+        || entry
+            .allowed_renderer_ip
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address == peer)
 }
 
 fn touch_hls_resource(resources: &mut HlsResourceStore, resource: &str) -> Option<String> {
@@ -919,6 +937,88 @@ fn content_range_total(headers: &HeaderMap) -> Option<HeaderValue> {
         .and_then(|_| HeaderValue::from_str(total).ok())
 }
 
+#[derive(Debug, Default)]
+struct FfmpegProgressParser {
+    pending_out_time_us: Option<u64>,
+    saw_out_time_us: bool,
+}
+
+impl FfmpegProgressParser {
+    /// Returns whether this is a machine-readable progress line and, at the end
+    /// of a complete stanza, the newest output timestamp in milliseconds.
+    fn consume_line(&mut self, line: &[u8]) -> (bool, Option<u64>) {
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(separator) = line.iter().position(|byte| *byte == b'=') else {
+            return (false, None);
+        };
+        let (key, value) = (&line[..separator], &line[separator + 1..]);
+        if key == b"out_time_us" {
+            self.saw_out_time_us = true;
+            self.pending_out_time_us = parse_ffmpeg_timestamp(value);
+            return (true, None);
+        }
+        // Older FFmpeg builds call the same microsecond value `out_time_ms`.
+        if key == b"out_time_ms" {
+            if !self.saw_out_time_us {
+                self.pending_out_time_us = parse_ffmpeg_timestamp(value);
+            }
+            return (true, None);
+        }
+        if key == b"progress" {
+            let timestamp = if value == b"continue" || value == b"end" {
+                self.pending_out_time_us.map(|value| value / 1_000)
+            } else {
+                None
+            };
+            self.pending_out_time_us = None;
+            self.saw_out_time_us = false;
+            return (true, timestamp);
+        }
+        (is_ffmpeg_progress_key(key), None)
+    }
+}
+
+fn parse_ffmpeg_timestamp(value: &[u8]) -> Option<u64> {
+    std::str::from_utf8(value).ok()?.trim().parse().ok()
+}
+
+fn is_ffmpeg_progress_key(key: &[u8]) -> bool {
+    key == b"frame"
+        || key == b"fps"
+        || key == b"bitrate"
+        || key == b"total_size"
+        || key == b"out_time"
+        || key == b"dup_frames"
+        || key == b"drop_frames"
+        || key == b"speed"
+        || key.starts_with(b"stream_")
+}
+
+fn retain_ffmpeg_diagnostic(retained: &mut Vec<u8>, line: &[u8]) {
+    if line.len() >= MAX_FFMPEG_DIAGNOSTICS_BYTES {
+        retained.clear();
+        retained.extend_from_slice(&line[line.len() - MAX_FFMPEG_DIAGNOSTICS_BYTES..]);
+        return;
+    }
+    retained.extend_from_slice(line);
+    if retained.len() > MAX_FFMPEG_DIAGNOSTICS_BYTES {
+        let excess = retained.len() - MAX_FFMPEG_DIAGNOSTICS_BYTES;
+        retained.drain(..excess);
+    }
+}
+
+fn append_ffmpeg_input_seek(command: &mut Command, start_offset_ms: u64) {
+    if let Some(offset) = ffmpeg_input_seek(start_offset_ms) {
+        command.arg("-ss").arg(offset);
+    }
+}
+
+fn ffmpeg_input_seek(start_offset_ms: u64) -> Option<String> {
+    (start_offset_ms > 0)
+        .then(|| format!("{}.{:03}", start_offset_ms / 1_000, start_offset_ms % 1_000))
+}
+
 struct FfmpegLease {
     _permit: OwnedSemaphorePermit,
     active_consumers: usize,
@@ -966,17 +1066,17 @@ fn ffmpeg_stream(state: &AppState, entry: &MediaEntry, lease: FfmpegLease) -> Re
     let token = &entry.token;
     let video = format!(
         "http://{}:{}/upstream/{token}/video",
-        state.advertise_ip(),
+        state.internal_http_ip(),
         state.web_port()
     );
     let audio = format!(
         "http://{}:{}/upstream/{token}/audio",
-        state.advertise_ip(),
+        state.internal_http_ip(),
         state.web_port()
     );
     let source = format!(
         "http://{}:{}/upstream/{token}/source",
-        state.advertise_ip(),
+        state.internal_http_ip(),
         state.web_port()
     );
     let mut command = Command::new(state.ffmpeg());
@@ -984,20 +1084,29 @@ fn ffmpeg_stream(state: &AppState, entry: &MediaEntry, lease: FfmpegLease) -> Re
         .arg("-nostdin")
         .arg("-hide_banner")
         .arg("-loglevel")
-        .arg("warning");
+        .arg("warning")
+        .arg("-nostats")
+        .arg("-stats_period")
+        .arg("1")
+        .arg("-progress")
+        .arg("pipe:2");
     match &entry.input {
         MediaInput::Dash { .. } => {
             command
                 .arg("-rw_timeout")
                 .arg("30000000")
                 .arg("-fflags")
-                .arg("+genpts")
+                .arg("+genpts");
+            append_ffmpeg_input_seek(&mut command, entry.start_offset_ms);
+            command
                 .arg("-i")
                 .arg(video)
                 .arg("-rw_timeout")
                 .arg("30000000")
                 .arg("-fflags")
-                .arg("+genpts")
+                .arg("+genpts");
+            append_ffmpeg_input_seek(&mut command, entry.start_offset_ms);
+            command
                 .arg("-i")
                 .arg(audio)
                 .arg("-map")
@@ -1014,7 +1123,9 @@ fn ffmpeg_stream(state: &AppState, entry: &MediaEntry, lease: FfmpegLease) -> Re
                 .arg("-rw_timeout")
                 .arg("30000000")
                 .arg("-fflags")
-                .arg("+genpts")
+                .arg("+genpts");
+            append_ffmpeg_input_seek(&mut command, entry.start_offset_ms);
+            command
                 .arg("-i")
                 .arg(source)
                 .arg("-map")
@@ -1055,23 +1166,31 @@ fn ffmpeg_stream(state: &AppState, entry: &MediaEntry, lease: FfmpegLease) -> Re
         .stdout
         .take()
         .context("FFmpeg stdout is unavailable")?;
-    let mut stderr = child
+    let stderr = child
         .stderr
         .take()
         .context("FFmpeg stderr is unavailable")?;
     let token_for_log = token.chars().take(8).collect::<String>();
     let cancellation = entry.cancellation.clone();
+    let remux_progress = entry.remux_progress.clone();
+    let progress_generation = remux_progress.begin_generation();
     let stderr_task = tokio::spawn(async move {
-        let mut buffer = vec![0_u8; 4096];
+        let mut stderr = BufReader::new(stderr);
+        let mut line = Vec::new();
         let mut retained = Vec::new();
+        let mut parser = FfmpegProgressParser::default();
         loop {
-            match stderr.read(&mut buffer).await {
+            line.clear();
+            match stderr.read_until(b'\n', &mut line).await {
                 Ok(0) => break,
-                Ok(length) => {
-                    retained.extend_from_slice(&buffer[..length]);
-                    if retained.len() > 64 * 1024 {
-                        let excess = retained.len() - 64 * 1024;
-                        retained.drain(..excess);
+                Ok(_) => {
+                    let (is_progress, out_time_ms) =
+                        FfmpegProgressParser::consume_line(&mut parser, &line);
+                    if let Some(out_time_ms) = out_time_ms {
+                        remux_progress.update(progress_generation, out_time_ms);
+                    }
+                    if !is_progress {
+                        retain_ffmpeg_diagnostic(&mut retained, &line);
                     }
                 }
                 Err(_) => break,
@@ -1302,13 +1421,19 @@ mod tests {
         let config = crate::config::RuntimeConfig {
             web_listen: std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 8080),
             nva_listen: std::net::SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 9959),
+            lelink_listen: std::net::SocketAddrV4::new(std::net::Ipv4Addr::UNSPECIFIED, 52288),
             advertise_ip: std::net::Ipv4Addr::new(192, 0, 2, 10),
             config_path: std::path::PathBuf::from("unused-config.json"),
             web_dir: std::path::PathBuf::from("web/dist"),
             ffmpeg: std::path::PathBuf::from("ffmpeg"),
-            friendly_name: "test".into(),
+            nva_name: "UniNVA".into(),
+            dlna_name: "UniDLNA".into(),
+            lelink_name: "UniLE".into(),
             device_uuid: uuid::Uuid::nil(),
+            nva_device_uuid: uuid::Uuid::nil(),
+            retired_nva_device_uuid: None,
             selected_udn: None,
+            scan_interface_ids: Vec::new(),
         };
         let state = AppState::new(&config).expect("test state");
         let entry = MediaEntry {
@@ -1318,10 +1443,15 @@ mod tests {
                 url: "https://cdn.example.net/video.mp4".into(),
             },
             mime: "video/mp4".into(),
+            duration_ms: None,
+            start_offset_ms: 0,
             created_unix_ms: 0,
             allowed_renderer_ip: "192.0.2.20".into(),
+            gateway_address: "192.0.2.10".into(),
             cancellation: CancellationToken::new(),
             ffmpeg_consumers: Arc::new(tokio::sync::Semaphore::new(MAX_FFMPEG_CONSUMERS)),
+            remux_progress: Arc::new(crate::state::RemuxProgress::default()),
+            playback_clock: Arc::new(crate::state::PlaybackClock::default()),
             hls_resources: Arc::new(tokio::sync::RwLock::new(HlsResourceStore::default())),
         };
         let rewritten = rewrite_hls_playlist(
@@ -1348,12 +1478,57 @@ mod tests {
                 audio_backup_urls: Vec::new(),
             },
             mime: "video/mp2t".into(),
+            duration_ms: None,
+            start_offset_ms: 0,
             created_unix_ms: 0,
             allowed_renderer_ip: "192.0.2.20".into(),
+            gateway_address: "192.0.2.10".into(),
             cancellation: CancellationToken::new(),
             ffmpeg_consumers: Arc::new(tokio::sync::Semaphore::new(MAX_FFMPEG_CONSUMERS)),
+            remux_progress: Arc::new(crate::state::RemuxProgress::default()),
+            playback_clock: Arc::new(crate::state::PlaybackClock::default()),
             hls_resources: Arc::new(tokio::sync::RwLock::new(HlsResourceStore::default())),
         }
+    }
+
+    #[test]
+    fn parses_complete_ffmpeg_progress_stanzas_in_milliseconds() {
+        let mut parser = FfmpegProgressParser::default();
+        assert_eq!(parser.consume_line(b"frame=42\r\n"), (true, None));
+        assert_eq!(
+            parser.consume_line(b"out_time_us=1234567\r\n"),
+            (true, None)
+        );
+        assert_eq!(
+            parser.consume_line(b"progress=continue\r\n"),
+            (true, Some(1_234))
+        );
+        assert_eq!(
+            parser.consume_line(b"[http @ 0001] HTTP error 403 Forbidden\r\n"),
+            (false, None)
+        );
+    }
+
+    #[test]
+    fn ffmpeg_progress_prefers_out_time_us_and_drops_invalid_stanzas() {
+        let mut parser = FfmpegProgressParser::default();
+        assert_eq!(parser.consume_line(b"out_time_ms=9000\n"), (true, None));
+        assert_eq!(parser.consume_line(b"out_time_us=12000\n"), (true, None));
+        assert_eq!(
+            parser.consume_line(b"progress=continue\n"),
+            (true, Some(12))
+        );
+
+        assert_eq!(parser.consume_line(b"out_time_us=-1\n"), (true, None));
+        assert_eq!(parser.consume_line(b"progress=continue\n"), (true, None));
+        assert_eq!(parser.consume_line(b"progress=unknown\n"), (true, None));
+    }
+
+    #[test]
+    fn ffmpeg_input_seek_preserves_the_millisecond_offset() {
+        assert_eq!(ffmpeg_input_seek(0), None);
+        assert_eq!(ffmpeg_input_seek(42_999).as_deref(), Some("42.999"));
+        assert_eq!(ffmpeg_input_seek(3_600_001).as_deref(), Some("3600.001"));
     }
 
     #[test]

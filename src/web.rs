@@ -14,7 +14,7 @@ use tokio::net::TcpListener;
 use tower_http::services::{ServeDir, ServeFile};
 use tracing::info;
 
-use crate::{dlna, media, state::AppState};
+use crate::{dlna, media, network::InterfaceSummary, state::AppState};
 
 const MANAGEMENT_REQUEST_HEADER: &str = "x-nva2dlna-request";
 
@@ -34,12 +34,26 @@ struct DevicePayload {
     friendly_name: String,
     location: String,
     model_name: Option<String>,
+    mode: &'static str,
+    protocols: Vec<&'static str>,
     online: bool,
 }
 
 #[derive(Deserialize)]
 struct TargetPayload {
     udn: String,
+}
+
+#[derive(Serialize)]
+struct NetworkInterfacesPayload {
+    interfaces: Vec<InterfaceSummary>,
+    selected_interface_ids: Vec<String>,
+    receive_interface_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UpdateNetworkInterfacesPayload {
+    selected_interface_ids: Vec<String>,
 }
 
 pub async fn run(state: AppState, listen: std::net::SocketAddrV4, web_dir: PathBuf) -> Result<()> {
@@ -50,6 +64,10 @@ pub async fn run(state: AppState, listen: std::net::SocketAddrV4, web_dir: PathB
         .route("/api/v1/status", get(status))
         .route("/api/v1/devices", get(devices))
         .route("/api/v1/discovery/scan", post(scan))
+        .route(
+            "/api/v1/network/interfaces",
+            get(network_interfaces).put(update_network_interfaces),
+        )
         .route("/api/v1/target", put(select_target))
         .route("/api/v1/session/stop", post(stop))
         .merge(media::routes())
@@ -95,13 +113,22 @@ async fn devices(State(state): State<AppState>) -> Json<Vec<DevicePayload>> {
             .public_renderers()
             .await
             .into_iter()
-            .map(|item| DevicePayload {
-                udn: item.renderer.udn,
-                friendly_name: item.renderer.friendly_name,
-                location: item.renderer.location,
-                model_name: (!item.renderer.model_name.is_empty())
-                    .then_some(item.renderer.model_name),
-                online: true,
+            .map(|item| {
+                let has_lelink = item.renderer.lelink.is_some();
+                DevicePayload {
+                    udn: item.renderer.udn,
+                    friendly_name: item.renderer.friendly_name,
+                    location: item.renderer.location,
+                    model_name: (!item.renderer.model_name.is_empty())
+                        .then_some(item.renderer.model_name),
+                    mode: if has_lelink { "lelink" } else { "dlna" },
+                    protocols: if has_lelink {
+                        vec!["dlna", "lelink"]
+                    } else {
+                        vec!["dlna"]
+                    },
+                    online: true,
+                }
             })
             .collect(),
     )
@@ -110,6 +137,32 @@ async fn devices(State(state): State<AppState>) -> Json<Vec<DevicePayload>> {
 async fn scan(State(state): State<AppState>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
     require_management_request(&headers)?;
     dlna::scan(state).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn network_interfaces(
+    State(state): State<AppState>,
+) -> Result<Json<NetworkInterfacesPayload>, ApiError> {
+    let (interfaces, selected_interface_ids, receive_interface_id) =
+        state.network_interfaces().await?;
+    Ok(Json(NetworkInterfacesPayload {
+        interfaces,
+        selected_interface_ids,
+        receive_interface_id,
+    }))
+}
+
+async fn update_network_interfaces(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<UpdateNetworkInterfacesPayload>,
+) -> Result<StatusCode, ApiError> {
+    require_management_request(&headers)?;
+    state
+        .set_scan_interface_ids(payload.selected_interface_ids)
+        .await?;
+    // The management page starts the scan after this request. Keeping this endpoint
+    // persistence-only avoids opening two overlapping 2.3-second multicast windows.
     Ok(StatusCode::NO_CONTENT)
 }
 

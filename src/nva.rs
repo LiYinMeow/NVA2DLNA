@@ -21,7 +21,7 @@ use crate::{
     bilibili::{BilibiliResolver, PlayRequest},
     dlna,
     frame::{self, Decoder, Frame},
-    state::{AppState, NvaEvent, SupersededPlay},
+    state::{AppState, NvaEvent, SessionOrigin, SupersededPlay},
     upnp,
 };
 
@@ -31,13 +31,22 @@ const READ_TIMEOUT: Duration = Duration::from_secs(8);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const NVA_SERVER: &str = "Linux/3.0.0, UPnP/1.0, Platinum/1.0.5.13";
+const NVA_HTTP_SERVER: &str = "UDashboardOS/1.0 UPnP/1.0 UDashboard/0.1";
 
 #[derive(Clone)]
 struct Receiver {
     state: AppState,
     resolver: BilibiliResolver,
-    active_request: Arc<Mutex<Option<(String, PlayRequest)>>>,
+    active_request: Arc<Mutex<Option<ActiveRequest>>>,
     port: u16,
+}
+
+#[derive(Clone)]
+struct ActiveRequest {
+    session_id: String,
+    request: PlayRequest,
+    available_qualities: Vec<u64>,
+    danmaku_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -106,12 +115,17 @@ async fn handle_connection(
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     let request = read_request(&mut stream).await?;
+    debug!(%peer, method = request.method, path = request.path, protocol = request.protocol, "NVA HTTP request");
     match request.method.as_str() {
         "SETUP" | "RESTORE" | "STARTRESTORE" => {
             handle_upgrade(receiver, stream, peer, request).await
         }
         "GET" | "HEAD" => {
-            let body = if request.path().eq_ignore_ascii_case("/description.xml") {
+            let body = if request.path().eq_ignore_ascii_case("/description.xml")
+                || request
+                    .path()
+                    .eq_ignore_ascii_case("/bilibili/description.xml")
+            {
                 Some(upnp::description_xml(&receiver.state, receiver.port))
             } else {
                 upnp::service_document(request.path()).map(str::to_owned)
@@ -260,7 +274,7 @@ async fn handle_upgrade(
         "{response_protocol} 200 OK\r\nNvaVersion: 1\r\nSession: {session_id}\r\n\
 Connection: Keep-Alive\r\nUUID: {}\r\nDate: {}\r\nContent-Length: 0\r\n\
 Server: {NVA_SERVER}\r\n\r\n",
-        upnp::nva_tv_id(receiver.state.device_uuid()),
+        upnp::nva_tv_id(receiver.state.nva_device_uuid()),
         Utc::now().format("%a, %d %b %Y %H:%M:%S GMT")
     );
     time::timeout(WRITE_TIMEOUT, stream.write_all(header.as_bytes())).await??;
@@ -346,13 +360,15 @@ async fn session_loop(
     });
 
     let outcome: Result<bool> = async {
-        if restore && let Some(event) = restore_play_state(&receiver.state, &session_id).await {
-            sequence = next_sequence(sequence);
-            let close_after = event.close_after;
-            write_event(&mut writer, sequence, &event).await?;
-            if close_after {
-                receiver.clear_active_request_if(&session_id).await;
-                return Ok(true);
+        if restore {
+            for event in receiver.restore_events(&session_id).await {
+                sequence = next_sequence(sequence);
+                let close_after = event.close_after;
+                write_event(&mut writer, sequence, &event).await?;
+                if close_after {
+                    receiver.clear_active_request_if(&session_id).await;
+                    return Ok(true);
+                }
             }
         }
         if !initial.is_empty() {
@@ -533,23 +549,35 @@ impl Receiver {
                 }
                 self.state.ensure_play_epoch(play_epoch)?;
                 self.broadcast_play_state(session_id, 3, false);
+                let danmaku_enabled = requested_danmaku_enabled(&params).unwrap_or(true);
+                let initial_speed = requested_speed(&params).unwrap_or(1.0);
                 let request = PlayRequest::from_value(&params)?;
                 let resolved = self.resolver.resolve_play(&request).await;
                 self.state.ensure_play_epoch(play_epoch)?;
                 let media = resolved?;
+                let live = media.live;
                 let quality = media.quality.clone();
                 let qualities = media.available_qualities.clone();
                 dlna::play(
                     self.state.clone(),
                     session_id,
+                    SessionOrigin::Nva,
                     media,
                     request.seek_position_ms,
                     play_epoch,
                 )
                 .await?;
                 self.state.ensure_play_epoch(play_epoch)?;
-                *self.active_request.lock().await = Some((session_id.to_owned(), request));
-                self.broadcast_quality(session_id, &quality, &qualities);
+                self.complete_successful_play(
+                    session_id,
+                    request,
+                    quality,
+                    qualities,
+                    danmaku_enabled,
+                    initial_speed,
+                    live,
+                )
+                .await;
                 Ok(())
             }
             "PlayUrl" => {
@@ -559,22 +587,34 @@ impl Receiver {
                 }
                 self.state.ensure_play_epoch(play_epoch)?;
                 self.broadcast_play_state(session_id, 3, false);
+                let danmaku_enabled = requested_danmaku_enabled(&params).unwrap_or(true);
+                let initial_speed = requested_speed(&params).unwrap_or(1.0);
                 let resolved = self.resolver.resolve_play_url(&params).await;
                 self.state.ensure_play_epoch(play_epoch)?;
                 let (request, media) = resolved?;
+                let live = media.live;
                 let quality = media.quality.clone();
                 let qualities = media.available_qualities.clone();
                 dlna::play(
                     self.state.clone(),
                     session_id,
+                    SessionOrigin::Nva,
                     media,
                     request.seek_position_ms,
                     play_epoch,
                 )
                 .await?;
                 self.state.ensure_play_epoch(play_epoch)?;
-                *self.active_request.lock().await = Some((session_id.to_owned(), request));
-                self.broadcast_quality(session_id, &quality, &qualities);
+                self.complete_successful_play(
+                    session_id,
+                    request,
+                    quality,
+                    qualities,
+                    danmaku_enabled,
+                    initial_speed,
+                    live,
+                )
+                .await;
                 Ok(())
             }
             "Pause" => dlna::pause(self.state.clone(), session_id).await,
@@ -608,11 +648,12 @@ impl Receiver {
                 dlna::set_volume(self.state.clone(), session_id, volume).await
             }
             "SwitchQn" => self.switch_quality(session_id, &params).await,
-            "SwitchSpeed" | "SwitchDanmaku" | "SendDanmaku" | "RequestDanmaku"
-            | "AppendDanmaku" => {
+            method if is_speed_command(method) => self.switch_speed(session_id, &params).await,
+            "SwitchDanmaku" => self.switch_danmaku(session_id, &params).await,
+            "SendDanmaku" | "RequestDanmaku" | "AppendDanmaku" => {
                 debug!(
                     method,
-                    "acknowledged and ignored unsupported NVA presentation feature"
+                    "acknowledged NVA danmaku payload without rendering it"
                 );
                 Ok(())
             }
@@ -636,14 +677,29 @@ impl Receiver {
                     .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
             })
             .ok_or_else(|| anyhow!("SwitchQn has no quality"))?;
-        let active = self.active_request.lock().await;
-        let (_, request) = active
-            .as_ref()
-            .filter(|(owner, _)| owner == session_id)
-            .ok_or_else(|| anyhow!("there is no resolvable active NVA media"))?;
-        let mut request = request.clone();
+        let (mut request, danmaku_enabled) = {
+            let current = self.active_request.lock().await;
+            let active = current
+                .as_ref()
+                .filter(|active| active.session_id == session_id)
+                .ok_or_else(|| anyhow!("there is no resolvable active NVA media"))?;
+            (active.request.clone(), active.danmaku_enabled)
+        };
         request.desired_quality = quality;
-        drop(active);
+        let (previous_rate, previous_live) = session_rate(&self.state, session_id).await;
+        let previous_paused = self
+            .state
+            .session()
+            .await
+            .is_some_and(|session| session.id == session_id && session.phase == "paused");
+        let previous_position_ms = if previous_live {
+            0
+        } else {
+            dlna::position(self.state.clone(), session_id)
+                .await
+                .map(|(position, _)| position)
+                .unwrap_or(0)
+        };
 
         let play_epoch = self.state.begin_play_epoch(session_id).await;
         let result = async {
@@ -653,8 +709,15 @@ impl Receiver {
             let selected = media.quality.clone();
             let qualities = media.available_qualities.clone();
             self.broadcast_play_state(session_id, 3, false);
-            if let Err(error) =
-                dlna::play(self.state.clone(), session_id, media, 0, play_epoch).await
+            if let Err(error) = dlna::play(
+                self.state.clone(),
+                session_id,
+                SessionOrigin::Nva,
+                media,
+                previous_position_ms,
+                play_epoch,
+            )
+            .await
             {
                 if error.downcast_ref::<SupersededPlay>().is_none()
                     && let Err(cleanup_error) =
@@ -669,13 +732,221 @@ impl Receiver {
                 return Err(error);
             }
             self.state.ensure_play_epoch(play_epoch)?;
-            *self.active_request.lock().await = Some((session_id.to_owned(), request));
-            self.broadcast_quality(session_id, &selected, &qualities);
+            *self.active_request.lock().await = Some(ActiveRequest {
+                session_id: session_id.to_owned(),
+                request: request.clone(),
+                available_qualities: qualities.clone(),
+                danmaku_enabled,
+            });
+            // A fresh play restarts the renderer at 1x, so the rate the phone was
+            // watching has to be put back on top of the new stream.
+            if previous_paused && !previous_live {
+                if let Err(error) = dlna::pause(self.state.clone(), session_id).await {
+                    debug!(%error, "renderer would not restore the paused state");
+                }
+            } else if previous_rate != 1.0 && !previous_live {
+                let speed = speed_argument(previous_rate);
+                if let Err(error) = dlna::set_speed(self.state.clone(), session_id, &speed).await {
+                    debug!(%error, %speed, "renderer would not take back the current rate");
+                }
+            }
+            if !previous_live {
+                let title = self
+                    .state
+                    .session()
+                    .await
+                    .filter(|session| session.id == session_id)
+                    .map_or_else(String::new, |session| session.title);
+                self.broadcast_control_state(
+                    session_id,
+                    danmaku_enabled,
+                    &request,
+                    &title,
+                    &selected,
+                    &qualities,
+                )
+                .await;
+            }
             Ok(())
         }
         .await;
         self.state.complete_play_epoch(play_epoch).await;
         result
+    }
+
+    /// A rate change is AVTransport `Play` with a different `Speed`, so a live stream
+    /// has nothing to change and is acknowledged without touching playback.
+    async fn switch_speed(&self, session_id: &str, params: &Value) -> Result<()> {
+        let Some(rate) = requested_speed(params) else {
+            debug!(method = "SwitchSpeed", "SwitchSpeed carried no usable rate");
+            return Ok(());
+        };
+        let (_, live) = session_rate(&self.state, session_id).await;
+        if live {
+            debug!(rate, "ignored SwitchSpeed for a live stream");
+            return Ok(());
+        }
+        let speed = speed_argument(rate);
+        let result = if dlna::target_accepts_speed(&self.state, &speed).await {
+            dlna::set_speed(self.state.clone(), session_id, &speed).await
+        } else {
+            debug!(speed, "target does not advertise this rate");
+            Ok(())
+        };
+        // Announce after the attempt either way: the phone builds its speed menu from
+        // this message, and silence is what leaves it showing a rate that is not playing.
+        self.broadcast_speed(session_id).await;
+        result
+    }
+
+    async fn switch_danmaku(&self, session_id: &str, params: &Value) -> Result<()> {
+        let Some(enabled) = requested_danmaku_enabled(params) else {
+            debug!(
+                method = "SwitchDanmaku",
+                "SwitchDanmaku carried no usable state"
+            );
+            return Ok(());
+        };
+        {
+            let mut current = self.active_request.lock().await;
+            let active = current
+                .as_mut()
+                .filter(|active| active.session_id == session_id)
+                .ok_or_else(|| anyhow!("there is no active NVA media"))?;
+            active.danmaku_enabled = enabled;
+        }
+        self.state.emit_nva(danmaku_event(session_id, enabled));
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_successful_play(
+        &self,
+        session_id: &str,
+        request: PlayRequest,
+        selected_quality: String,
+        available_qualities: Vec<u64>,
+        danmaku_enabled: bool,
+        initial_speed: f64,
+        live: bool,
+    ) {
+        *self.active_request.lock().await = Some(ActiveRequest {
+            session_id: session_id.to_owned(),
+            request: request.clone(),
+            available_qualities: available_qualities.clone(),
+            danmaku_enabled,
+        });
+
+        // A DLNA target can apply the sender's initial rate only through another
+        // AVTransport Play. Treat that as best effort: the media is already playing,
+        // and a target that did not advertise the rate must not make Play fail.
+        if !live && initial_speed != 1.0 {
+            let speed = speed_argument(initial_speed);
+            if dlna::target_accepts_speed(&self.state, &speed).await {
+                if let Err(error) = dlna::set_speed(self.state.clone(), session_id, &speed).await {
+                    debug!(%error, %speed, "renderer rejected the initial NVA rate");
+                }
+            } else {
+                debug!(%speed, "target does not advertise the initial NVA rate");
+            }
+        }
+
+        if !live {
+            let title = self
+                .state
+                .session()
+                .await
+                .filter(|session| session.id == session_id)
+                .map_or_else(String::new, |session| session.title);
+            self.broadcast_control_state(
+                session_id,
+                danmaku_enabled,
+                &request,
+                &title,
+                &selected_quality,
+                &available_qualities,
+            )
+            .await;
+        }
+    }
+
+    /// These four messages are a capability handshake for Android senders.  Keep
+    /// them adjacent and in UDashboard's order: interleaving an awaited state read
+    /// after the first event can make a phone decide the later controls are absent.
+    async fn broadcast_control_state(
+        &self,
+        session_id: &str,
+        danmaku_enabled: bool,
+        request: &PlayRequest,
+        title: &str,
+        selected_quality: &str,
+        available_qualities: &[u64],
+    ) {
+        let events = control_state_events(
+            &self.state,
+            session_id,
+            danmaku_enabled,
+            request,
+            title,
+            selected_quality,
+            available_qualities,
+        )
+        .await;
+        for event in events {
+            self.state.emit_nva(event);
+        }
+    }
+
+    async fn restore_events(&self, session_id: &str) -> Vec<NvaEvent> {
+        let Some(session) = self
+            .state
+            .session()
+            .await
+            .filter(|session| session.id == session_id)
+        else {
+            return vec![play_state_event(session_id, 7, true)];
+        };
+        let active = self
+            .active_request
+            .lock()
+            .await
+            .as_ref()
+            .filter(|active| active.session_id == session_id)
+            .cloned();
+        let danmaku_enabled = active.as_ref().is_none_or(|active| active.danmaku_enabled);
+        let available_qualities = active
+            .as_ref()
+            .map_or(&[][..], |active| active.available_qualities.as_slice());
+        let mut events = vec![play_state_event(
+            session_id,
+            play_state_for_phase(&session.phase),
+            false,
+        )];
+        if session.live {
+            return events;
+        }
+        let default_request = PlayRequest::default();
+        let request = active
+            .as_ref()
+            .map_or(&default_request, |active| &active.request);
+        events.extend(
+            control_state_events(
+                &self.state,
+                session_id,
+                danmaku_enabled,
+                request,
+                &session.title,
+                &session.quality,
+                available_qualities,
+            )
+            .await,
+        );
+        events
+    }
+
+    async fn broadcast_speed(&self, session_id: &str) {
+        let event = speed_event(&self.state, session_id).await;
+        self.state.emit_nva(event);
     }
 
     fn broadcast_play_state(&self, session_id: &str, play_state: u8, close_after: bool) {
@@ -691,65 +962,20 @@ impl Receiver {
         let mut active = self.active_request.lock().await;
         if active
             .as_ref()
-            .is_some_and(|(owner, _)| owner == session_id)
+            .is_some_and(|active| active.session_id == session_id)
         {
             *active = None;
         }
     }
-
-    fn broadcast_quality(&self, session_id: &str, selected: &str, qualities: &[u64]) {
-        let current = selected.parse::<u64>().unwrap_or(0);
-        let mut qualities = qualities
-            .iter()
-            .copied()
-            .filter(|quality| *quality != 0)
-            .collect::<Vec<_>>();
-        if current != 0 && !qualities.contains(&current) {
-            qualities.push(current);
-        }
-        qualities.dedup();
-        let options = qualities
-            .into_iter()
-            .map(|quality| {
-                let description = quality_description(quality);
-                json!({
-                    "description": description,
-                    "displayDesc": description,
-                    "needLogin": false,
-                    "needVip": false,
-                    "quality": quality,
-                    "superscript": "NVA2DLNA"
-                })
-            })
-            .collect::<Vec<_>>();
-        self.state.emit_nva(NvaEvent {
-            session_id: session_id.to_owned(),
-            method: "OnQnSwitch".into(),
-            params: Some(json!({
-                "curQn": current,
-                "supportQnList": options,
-                "userDesireQn": current
-            })),
-            close_after: false,
-        });
-    }
 }
 
-async fn restore_play_state(state: &AppState, session_id: &str) -> Option<NvaEvent> {
-    let session = state
-        .session()
-        .await
-        .filter(|session| session.id == session_id);
-    let play_state = match session {
-        Some(session) => play_state_for_phase(&session.phase),
-        None => 7,
-    };
-    Some(NvaEvent {
+fn play_state_event(session_id: &str, play_state: u8, close_after: bool) -> NvaEvent {
+    NvaEvent {
         session_id: session_id.to_owned(),
         method: "OnPlayState".into(),
         params: Some(json!({"playState": play_state})),
-        close_after: play_state == 7,
-    })
+        close_after,
+    }
 }
 
 fn play_state_for_phase(phase: &str) -> u8 {
@@ -761,6 +987,113 @@ fn play_state_for_phase(phase: &str) -> u8 {
     }
 }
 
+fn danmaku_event(session_id: &str, enabled: bool) -> NvaEvent {
+    NvaEvent {
+        session_id: session_id.to_owned(),
+        method: "OnDanmakuSwitch".into(),
+        params: Some(json!({"open": enabled})),
+        close_after: false,
+    }
+}
+
+fn quality_payload(selected: &str, qualities: &[u64]) -> Value {
+    let current = selected.parse::<u64>().unwrap_or(0);
+    let mut qualities = qualities
+        .iter()
+        .copied()
+        .filter(|quality| *quality != 0)
+        .collect::<Vec<_>>();
+    if current != 0 && !qualities.contains(&current) {
+        qualities.push(current);
+    }
+    // Direct PlayUrl media has no Bilibili quality catalog. UDashboard still
+    // publishes one qn=0 option so Android clients keep a valid source-quality
+    // selection instead of treating an empty menu as an unsupported control.
+    if qualities.is_empty() {
+        qualities.push(current);
+    }
+    qualities.dedup();
+    let options = qualities
+        .into_iter()
+        .map(|quality| {
+            let description = quality_description(quality);
+            json!({
+                "description": description,
+                "displayDesc": description,
+                "needLogin": false,
+                "needVip": false,
+                "quality": quality,
+                "superscript": "NVA2DLNA"
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "curQn": current,
+        "supportQnList": options,
+        "userDesireQn": current
+    })
+}
+
+fn episode_event(
+    session_id: &str,
+    request: &PlayRequest,
+    title: &str,
+    selected: &str,
+    qualities: &[u64],
+) -> NvaEvent {
+    NvaEvent {
+        session_id: session_id.to_owned(),
+        method: "OnEpisodeSwitch".into(),
+        params: Some(json!({
+            "playItem": {
+                "aid": request.aid,
+                "cid": request.cid,
+                "contentType": request.content_type,
+                "epId": request.episode_id,
+                "seasonId": request.season_id,
+            },
+            "qnDesc": quality_payload(selected, qualities),
+            "title": title,
+        })),
+        close_after: false,
+    }
+}
+
+fn quality_event(session_id: &str, selected: &str, qualities: &[u64]) -> NvaEvent {
+    NvaEvent {
+        session_id: session_id.to_owned(),
+        method: "OnQnSwitch".into(),
+        params: Some(quality_payload(selected, qualities)),
+        close_after: false,
+    }
+}
+
+async fn control_state_events(
+    state: &AppState,
+    session_id: &str,
+    danmaku_enabled: bool,
+    request: &PlayRequest,
+    title: &str,
+    selected_quality: &str,
+    available_qualities: &[u64],
+) -> Vec<NvaEvent> {
+    // Resolve the applied speed before emitting anything so the four capability
+    // announcements remain adjacent on the broadcast channel.
+    let speed = speed_event(state, session_id).await;
+    vec![
+        danmaku_event(session_id, danmaku_enabled),
+        episode_event(
+            session_id,
+            request,
+            title,
+            selected_quality,
+            available_qualities,
+        ),
+        quality_event(session_id, selected_quality, available_qualities),
+        speed,
+    ]
+}
+
 fn command_failure_is_terminal(method: &str) -> bool {
     matches!(method, "Play" | "PlayUrl")
 }
@@ -769,8 +1102,124 @@ fn command_failure_requires_cleanup(method: &str, superseded: bool) -> bool {
     command_failure_is_terminal(method) && !superseded
 }
 
+/// The rates a phone puts in its speed menu once a device announces them. The list
+/// is what the menu is built from, which is why [`SPEED_EVENT`] has to be sent even
+/// when the current rate is the obvious 1x.
+const SPEED_MENU: [f64; 6] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+const SPEED_EVENT: &str = "SpeedChanged";
+/// Widest and narrowest multiplier a sender may ask for. Outside this the phone has
+/// no UI for it and most renderers reject the value.
+const MIN_SPEED: f64 = 0.25;
+const MAX_SPEED: f64 = 4.0;
+
+fn flexible_bool(value: &Value) -> Option<bool> {
+    value.as_bool().or_else(|| {
+        value.as_str().and_then(|value| {
+            if value.eq_ignore_ascii_case("true") || value == "1" {
+                Some(true)
+            } else if value.eq_ignore_ascii_case("false") || value == "0" {
+                Some(false)
+            } else {
+                None
+            }
+        })
+    })
+}
+
+/// Initial Play and later SwitchDanmaku commands use different names for the
+/// same persisted preference across Bilibili Android releases.
+fn requested_danmaku_enabled(params: &Value) -> Option<bool> {
+    [
+        "open",
+        "enabled",
+        "danmakuOpen",
+        "danmaku_open",
+        "danmakuSwitch",
+        "danmaku_switch",
+        "danmakuSwitchSave",
+        "danmaku_switch_save",
+    ]
+    .iter()
+    .find_map(|key| params.get(*key))
+    .and_then(flexible_bool)
+}
+
+/// Bilibili clients disagree on the key they put the rate under, and the value is a
+/// plain multiplier rather than an index into the announced menu.
+fn requested_speed(params: &Value) -> Option<f64> {
+    [
+        "speed",
+        "currSpeed",
+        "curr_speed",
+        "userDesireSpeed",
+        "user_desire_speed",
+        "desireSpeed",
+        "desire_speed",
+        "rate",
+        "playSpeed",
+        "value",
+    ]
+    .iter()
+    .find_map(|key| params.get(*key))
+    .and_then(|value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+    })
+    .filter(|rate| rate.is_finite() && *rate > 0.0)
+    .map(|rate| rate.clamp(MIN_SPEED, MAX_SPEED))
+}
+
+fn is_speed_command(method: &str) -> bool {
+    matches!(method, "SwitchSpeed" | "PlaySpeed")
+}
+
+/// The AVTransport `Speed` argument for a multiplier. Whole numbers go out bare so
+/// they match the trick-play values renderers advertise, and everything is rounded
+/// to two decimals because that is the shape of the advertised `allowedValueList`.
+fn speed_argument(rate: f64) -> String {
+    let rate = (rate * 100.0).round() / 100.0;
+    if rate == rate.floor() {
+        format!("{}", rate as u64)
+    } else {
+        format!("{rate}")
+    }
+}
+
+/// The rate a session is holding and whether its media can hold one at all: a live
+/// stream has no timeline to speed up.
+async fn session_rate(state: &AppState, session_id: &str) -> (f64, bool) {
+    let session = state
+        .session()
+        .await
+        .filter(|session| session.id == session_id);
+    let live = session.as_ref().is_some_and(|session| session.live);
+    let rate = session
+        .and_then(|session| session.speed.parse::<f64>().ok())
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
+        .unwrap_or(1.0);
+    (rate, live)
+}
+
+/// Reports the rate the bridge actually applied. Reading it back instead of echoing
+/// the request is what keeps a renderer that rejected the value from leaving the
+/// phone showing a speed that is not happening.
+async fn speed_event(state: &AppState, session_id: &str) -> NvaEvent {
+    let (rate, _) = session_rate(state, session_id).await;
+    NvaEvent {
+        session_id: session_id.to_owned(),
+        method: SPEED_EVENT.into(),
+        params: Some(json!({
+            "currSpeed": rate,
+            "supportSpeedList": &SPEED_MENU[..],
+        })),
+        close_after: false,
+    }
+}
+
 fn quality_description(quality: u64) -> String {
     match quality {
+        0 => "源画质".into(),
         6 => "极速 240P".into(),
         16 => "流畅 360P".into(),
         32 => "清晰 480P".into(),
@@ -869,8 +1318,9 @@ async fn write_response(
 ) -> Result<()> {
     let mut header = format!(
         "{protocol} {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
-Connection: close\r\nServer: NVA2DLNA/0.1\r\n",
-        declared_length.unwrap_or(body.len())
+Date: {}\r\nServer: {NVA_HTTP_SERVER}\r\nConnection: close\r\n",
+        declared_length.unwrap_or(body.len()),
+        Utc::now().format("%a, %d %b %Y %H:%M:%S GMT")
     );
     for line in extra {
         header.push_str(line);
@@ -954,5 +1404,267 @@ mod tests {
         assert!(!command_failure_requires_cleanup("Play", true));
         assert!(!command_failure_requires_cleanup("PlayUrl", true));
         assert!(command_failure_requires_cleanup("Play", false));
+    }
+
+    #[test]
+    fn every_client_spelling_of_a_rate_is_understood() {
+        for key in [
+            "speed",
+            "currSpeed",
+            "userDesireSpeed",
+            "desire_speed",
+            "value",
+        ] {
+            let params = json!({(key): 1.5});
+            assert_eq!(requested_speed(&params), Some(1.5), "{key}");
+        }
+        assert_eq!(requested_speed(&json!({"rate": " 1.50 "})), Some(1.5));
+        assert_eq!(requested_speed(&json!({"speed": 99})), Some(4.0));
+        assert_eq!(requested_speed(&json!({"speed": 0.1})), Some(0.25));
+        for params in [
+            json!({}),
+            json!({"speed": 0}),
+            json!({"speed": -1}),
+            json!({"speed": "max"}),
+            json!({"quality": 80}),
+        ] {
+            assert_eq!(requested_speed(&params), None, "{params}");
+        }
+    }
+
+    #[test]
+    fn play_speed_is_a_switch_speed_command_alias() {
+        assert!(is_speed_command("SwitchSpeed"));
+        assert!(is_speed_command("PlaySpeed"));
+        assert!(!is_speed_command("SpeedChanged"));
+    }
+
+    #[test]
+    fn play_and_switch_danmaku_aliases_are_understood() {
+        for params in [
+            json!({"open": false}),
+            json!({"enabled": "false"}),
+            json!({"danmakuOpen": false}),
+            json!({"danmaku_switch": "0"}),
+            json!({"danmakuSwitchSave": "false"}),
+            json!({"danmaku_switch_save": false}),
+        ] {
+            assert_eq!(requested_danmaku_enabled(&params), Some(false), "{params}");
+        }
+        assert_eq!(
+            requested_danmaku_enabled(&json!({"open": "true"})),
+            Some(true)
+        );
+        assert_eq!(requested_danmaku_enabled(&json!({"open": "invalid"})), None);
+        assert!(requested_danmaku_enabled(&json!({})).unwrap_or(true));
+    }
+
+    #[test]
+    fn rates_are_normalised_to_the_shortest_form_avtransport_accepts() {
+        assert_eq!(speed_argument(2.0), "2");
+        assert_eq!(speed_argument(1.0), "1");
+        assert_eq!(speed_argument(1.50), "1.5");
+        assert_eq!(speed_argument(1.25), "1.25");
+        assert_eq!(speed_argument(1.3333), "1.33");
+        assert_eq!(speed_argument(0.25), "0.25");
+    }
+
+    #[tokio::test]
+    async fn the_speed_announcement_repeats_the_menu_and_the_applied_rate() {
+        let state = speed_test_state().await;
+        let params = speed_event(&state, "s-1")
+            .await
+            .params
+            .expect("SpeedChanged carries parameters");
+        assert_eq!(params["currSpeed"], json!(1.25));
+        assert_eq!(
+            params["supportSpeedList"],
+            json!([0.5, 0.75, 1.0, 1.25, 1.5, 2.0])
+        );
+        // An unknown session is reported at neutral speed instead of not at all: the
+        // menu the phone builds comes from this message and nothing else.
+        assert_eq!(session_rate(&state, "another").await, (1.0, false));
+    }
+
+    #[tokio::test]
+    async fn successful_play_controls_follow_udashboard_order() {
+        let state = speed_test_state().await;
+        let request = PlayRequest {
+            aid: "42".into(),
+            cid: "99".into(),
+            episode_id: "7".into(),
+            season_id: "6".into(),
+            content_type: 2,
+            ..PlayRequest::default()
+        };
+        let events =
+            control_state_events(&state, "s-1", false, &request, "正片", "120", &[120, 80]).await;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.method.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "OnDanmakuSwitch",
+                "OnEpisodeSwitch",
+                "OnQnSwitch",
+                "SpeedChanged"
+            ]
+        );
+        assert_eq!(events[0].params.as_ref().unwrap()["open"], false);
+        assert_eq!(events[1].params.as_ref().unwrap()["playItem"]["aid"], "42");
+        assert_eq!(
+            events[1].params.as_ref().unwrap()["playItem"]["seasonId"],
+            "6"
+        );
+        assert_eq!(
+            events[1].params.as_ref().unwrap()["playItem"]["contentType"],
+            2
+        );
+        assert_eq!(events[2].params.as_ref().unwrap()["curQn"], 120);
+        assert_eq!(events[3].params.as_ref().unwrap()["currSpeed"], 1.25);
+    }
+
+    #[tokio::test]
+    async fn direct_play_url_advertises_source_quality_instead_of_an_empty_menu() {
+        let state = speed_test_state().await;
+        let events = control_state_events(
+            &state,
+            "s-1",
+            true,
+            &PlayRequest::default(),
+            "直链",
+            "source",
+            &[],
+        )
+        .await;
+        let quality = events[2].params.as_ref().unwrap();
+        assert_eq!(quality["curQn"], 0);
+        assert_eq!(quality["supportQnList"][0]["quality"], 0);
+        assert_eq!(quality["supportQnList"][0]["displayDesc"], "源画质");
+    }
+
+    #[tokio::test]
+    async fn restore_repeats_play_and_all_phone_control_state() {
+        let state = speed_test_state().await;
+        let receiver = test_receiver(state, false);
+        let events = receiver.restore_events("s-1").await;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.method.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "OnPlayState",
+                "OnDanmakuSwitch",
+                "OnEpisodeSwitch",
+                "OnQnSwitch",
+                "SpeedChanged"
+            ]
+        );
+        assert_eq!(events[0].params.as_ref().unwrap()["playState"], 4);
+        assert_eq!(events[1].params.as_ref().unwrap()["open"], false);
+        assert_eq!(events[2].params.as_ref().unwrap()["title"], "正片");
+        assert_eq!(events[3].params.as_ref().unwrap()["curQn"], 80);
+        assert_eq!(events[4].params.as_ref().unwrap()["currSpeed"], 1.25);
+    }
+
+    #[tokio::test]
+    async fn live_restore_does_not_advertise_vod_only_controls() {
+        let state = speed_test_state().await;
+        let mut session = state.session().await.unwrap();
+        session.live = true;
+        state.set_session(Some(session)).await;
+        let receiver = test_receiver(state, true);
+        let events = receiver.restore_events("s-1").await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].method, "OnPlayState");
+    }
+
+    #[tokio::test]
+    async fn switch_danmaku_persists_and_echoes_the_new_state() {
+        let state = speed_test_state().await;
+        let mut events = state.subscribe_nva();
+        let receiver = test_receiver(state, true);
+        receiver
+            .switch_danmaku("s-1", &json!({"danmakuSwitch": "false"}))
+            .await
+            .unwrap();
+        let event = events.recv().await.unwrap();
+        assert_eq!(event.method, "OnDanmakuSwitch");
+        assert_eq!(event.params.unwrap()["open"], false);
+        assert!(
+            !receiver
+                .active_request
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .danmaku_enabled
+        );
+    }
+
+    fn test_receiver(state: AppState, danmaku_enabled: bool) -> Receiver {
+        Receiver {
+            state,
+            resolver: BilibiliResolver::new().expect("test resolver"),
+            active_request: Arc::new(Mutex::new(Some(ActiveRequest {
+                session_id: "s-1".into(),
+                request: PlayRequest {
+                    aid: "42".into(),
+                    cid: "99".into(),
+                    episode_id: "7".into(),
+                    season_id: "6".into(),
+                    content_type: 2,
+                    ..PlayRequest::default()
+                },
+                available_qualities: vec![120, 80],
+                danmaku_enabled,
+            }))),
+            port: 9959,
+        }
+    }
+
+    async fn speed_test_state() -> AppState {
+        use crate::state::SessionView;
+        use std::{net::Ipv4Addr, path::PathBuf};
+        use uuid::Uuid;
+        let state = AppState::new(&crate::config::RuntimeConfig {
+            web_listen: std::net::SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8080),
+            nva_listen: std::net::SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 9959),
+            lelink_listen: std::net::SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 52288),
+            advertise_ip: Ipv4Addr::new(192, 0, 2, 10),
+            config_path: PathBuf::from("unused.json"),
+            web_dir: PathBuf::from("web/dist"),
+            ffmpeg: PathBuf::from("ffmpeg"),
+            nva_name: "UniNVA".into(),
+            dlna_name: "UniDLNA".into(),
+            lelink_name: "UniLE".into(),
+            device_uuid: Uuid::nil(),
+            nva_device_uuid: Uuid::nil(),
+            retired_nva_device_uuid: None,
+            selected_udn: None,
+            scan_interface_ids: Vec::new(),
+        })
+        .expect("test state");
+        state
+            .set_session(Some(SessionView {
+                id: "s-1".into(),
+                origin: SessionOrigin::Nva,
+                title: "正片".into(),
+                phase: "playing".into(),
+                quality: "80".into(),
+                speed: speed_argument(1.25),
+                input: "dash".into(),
+                output: "mp2t".into(),
+                backend: crate::state::SessionBackend::Dlna,
+                target_name: "Fake TV".into(),
+                target_udn: "uuid:fake".into(),
+                started_unix_ms: 0,
+                error: None,
+                live: false,
+            }))
+            .await;
+        state
     }
 }

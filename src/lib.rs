@@ -1,8 +1,12 @@
 pub mod bilibili;
 pub mod config;
 pub mod dlna;
+pub mod dmr;
 pub mod frame;
+pub mod lelink;
+pub mod lelink_discovery;
 pub mod media;
+pub mod network;
 pub mod nva;
 pub mod ssdp;
 pub mod state;
